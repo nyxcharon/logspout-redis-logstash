@@ -4,7 +4,7 @@ kibana:
     - elasticsearch
   ports:
     - 5601:5601
-  
+
 elasticsearch:
   image: elasticsearch:1.7.4
   ports:
@@ -25,7 +25,7 @@ logstash:
     - elasticsearch
 
 logspout:
-  image: rtoma/logspout-redis-logstash:0.1.1
+  image: nyxcharon/logspout-redis-logstash:latest
   command: 'redis://redis'
   environment:
     - DEBUG=true

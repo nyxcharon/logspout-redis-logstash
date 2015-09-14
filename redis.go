@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"net"
 
 	"github.com/garyburd/redigo/redis"
 	"github.com/gliderlabs/logspout/router"
@@ -33,6 +34,8 @@ type RedisAdapter struct {
 	docker_host   string
 	use_v0        bool
 	logstash_type string
+	stack         string
+	instance_id   string
 }
 
 type DockerFields struct {
@@ -54,6 +57,8 @@ type LogstashMessageV0 struct {
 	Sourcehost string         `json:"@source_host"`
 	Message    string         `json:"@message"`
 	Fields     LogstashFields `json:"@fields"`
+	Stack      string         `json:"stack"`
+	InstanceId string         `json:"instance-id"`
 }
 
 type LogstashMessageV1 struct {
@@ -62,6 +67,8 @@ type LogstashMessageV1 struct {
 	Sourcehost string       `json:"host"`
 	Message    string       `json:"message"`
 	Fields     DockerFields `json:"docker"`
+	Stack      string       `json:"stack"`
+	InstanceId string       `json:"instance-id"`
 	Logtype    string       `json:"logtype,omitempty"`
 	// Only one of the following 3 is initialized and used, depending on the incoming json:logtype
 	LogtypeAccessfields map[string]interface{} `json:"accesslog,omitempty"`
@@ -120,6 +127,8 @@ func NewRedisAdapter(route *router.Route) (router.LogAdapter, error) {
 		docker_host:   docker_host,
 		use_v0:        use_v0,
 		logstash_type: logstash_type,
+		stack:         os.Getenv("AWS_STACK"),
+		instance_id:   os.Getenv("AWS_INSTANCE_ID"),
 	}, nil
 }
 
@@ -130,7 +139,8 @@ func (a *RedisAdapter) Stream(logstream chan *router.Message) {
 	mute := false
 
 	for m := range logstream {
-		js, err := createLogstashMessage(m, a.docker_host, a.use_v0, a.logstash_type)
+		//log.Println("Message:",m)
+		js, err := createLogstashMessage(m, a.docker_host, a.use_v0, a.logstash_type, a.stack, a.instance_id)
 		if err != nil {
 			if !mute {
 				log.Println("redis: error on json.Marshal (muting until recovered): ", err)
@@ -138,26 +148,40 @@ func (a *RedisAdapter) Stream(logstream chan *router.Message) {
 			}
 			continue
 		}
+	//	log.Println("RPUSH to redis")
 		_, err = conn.Do("RPUSH", a.key, js)
 		if err != nil {
-			if !mute {
+
+		//	if !mute {
 				log.Println("redis: error on rpush (muting until restored): ", err)
-				mute = true
-			}
+				log.Println("Active Pool Connections",  a.pool.ActiveCount())
+			//	mute = true
+			//}
+			// success := false
+			// for success != true {
+				log.Println("retrying to send logs to redis")
+				// first close old connection
+				conn.Close()
 
-			// first close old connection
-			conn.Close()
+				// next open new connection
+				conn = a.pool.Get()
 
-			// next open new connection
-			conn = a.pool.Get()
+				// since message is already marshaled, send again
+				test, err := conn.Do("RPUSH", a.key, js)
+				log.Println("RPUSH:",test)
+				log.Println("RPUSH err:",err)
 
-			// since message is already marshaled, send again
-			_, _ = conn.Do("RPUSH", a.key, js)
+			// 	if err == nil {
+			// 		success = true
+			// 	}
+			// }
 
 			continue
 		}
-		mute = false
+		//mute = false
 	}
+	log.Println("Closing Stream")
+	conn.Close()
 }
 
 func errorf(format string, a ...interface{}) (err error) {
@@ -181,31 +205,59 @@ func getopt(options map[string]string, optkey string, envkey string, default_val
 
 func newRedisConnectionPool(server, password string, database int) *redis.Pool {
 	return &redis.Pool{
-		MaxIdle:     3,
-		IdleTimeout: 240 * time.Second,
+		MaxIdle:     5,
+		IdleTimeout: 2 * time.Second,
+		Wait: false,
 		Dial: func() (redis.Conn, error) {
-			c, err := redis.Dial("tcp", server)
+			log.Println("DIAL")
+			dialer := &net.Dialer{Timeout: 3 * time.Second}
+			c, err := redis.Dial("tcp",
+					server,
+					redis.DialNetDial(MakeRetryDialer(dialer, 3)))
 			if err != nil {
+				log.Println("Conn: Return nil")
 				return nil, err
 			}
 			if password != "" {
 				if _, err := c.Do("AUTH", password); err != nil {
+					log.Println("Conn: Return nil")
 					c.Close()
 					return nil, err
 				}
 			}
 			if database > 0 {
 				if _, err := c.Do("SELECT", database); err != nil {
+					log.Println("Conn: Return nil")
 					c.Close()
 					return nil, err
 				}
 			}
+			log.Println("Conn: Return c")
+			log.Println(c)
 			return c, nil
 		},
 		TestOnBorrow: func(c redis.Conn, t time.Time) error {
-			_, err := c.Do("PING")
+			tob, err := c.Do("PING")
+			log.Println("TestOnBorrow: ",tob,err)
 			return err
 		},
+	}
+}
+
+func MakeRetryDialer(dialer *net.Dialer, retry int) func(string, string) (net.Conn, error) {
+	return func(network string, address string) (net.Conn, error) {
+		var conn net.Conn
+		var err error
+		for i := 0; i < retry; i++ {
+			conn, err = dialer.Dial(network, address)
+			if err == nil {
+				return conn, err
+			}
+		}
+		if err == nil {
+			err = fmt.Errorf("No connections or errors for retry on hostname %s", address)
+		}
+		return nil, err
 	}
 }
 
@@ -221,7 +273,7 @@ func splitImage(image_tag string) (image string, tag string) {
 	return
 }
 
-func createLogstashMessage(m *router.Message, docker_host string, use_v0 bool, logstash_type string) ([]byte, error) {
+func createLogstashMessage(m *router.Message, docker_host string, use_v0 bool, logstash_type, stack, instance_id string) ([]byte, error) {
 	image, image_tag := splitImage(m.Container.Config.Image)
 	cid := m.Container.ID[0:12]
 	name := m.Container.Name[1:]
@@ -240,6 +292,8 @@ func createLogstashMessage(m *router.Message, docker_host string, use_v0 bool, l
 		msg.Fields.Docker.ImageTag = image_tag
 		msg.Fields.Docker.Source = m.Source
 		msg.Fields.Docker.DockerHost = docker_host
+		msg.Stack = stack
+		msg.InstanceId = instance_id
 
 		return json.Marshal(msg)
 	} else {
@@ -254,6 +308,8 @@ func createLogstashMessage(m *router.Message, docker_host string, use_v0 bool, l
 		msg.Fields.ImageTag = image_tag
 		msg.Fields.Source = m.Source
 		msg.Fields.DockerHost = docker_host
+		msg.Stack = stack
+		msg.InstanceId = instance_id
 
 		// Check if the message to log itself is json
 		if validJsonMessage(strings.TrimSpace(m.Data)) {
